@@ -388,6 +388,7 @@ export const App: React.FC = () => {
   const [loginPin, setLoginPin] = useState('');
   const [isAdminMode, setIsAdminMode] = useState(false);
   const [loginError, setLoginError] = useState('');
+  const [supabaseError, setSupabaseError] = useState<string | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>(Tab.HOME);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -537,10 +538,15 @@ export const App: React.FC = () => {
     addToast("copiado", `${label} listo para pegar`, "success");
   };
 
+  // Carga inicial: se ejecuta estrictamente 1 sola vez al montar el componente (no en cada segundo ni cambio de hora)
   useEffect(() => {
     fetchEmployees();
     fetchAppSettings();
     fetchAllSchedules();
+  }, []);
+
+  // Reloj local en vivo: corre en memoria sin disparar llamadas a Supabase
+  useEffect(() => {
     const timer = setInterval(() => setCurrentTime(getNow()), 1000);
     return () => clearInterval(timer);
   }, [getNow]);
@@ -626,21 +632,26 @@ export const App: React.FC = () => {
   const fetchAppSettings = async () => {
     if (!supabase) return;
     try {
-      const { data: locData } = await supabase.from('app_settings').select('value').eq('key', 'office_location').maybeSingle();
-      if (locData) setOfficeLocation(locData.value);
-
-      const { data: telData } = await supabase.from('app_settings').select('value').eq('key', 'telegram_config').maybeSingle();
-      if (telData) setTelegramConfig(telData.value);
-
-      const { data: emailData } = await supabase.from('app_settings').select('value').eq('key', 'notify_email').maybeSingle();
-      if (emailData && emailData.value?.email) setNotifyEmail(emailData.value.email);
+      // 1 sola consulta agrupada en lugar de 3 llamadas consecutivas
+      const { data, error } = await supabase.from('app_settings').select('key, value');
+      if (error || !data) return;
+      const loc = data.find(d => d.key === 'office_location');
+      if (loc?.value) setOfficeLocation(loc.value);
+      const tel = data.find(d => d.key === 'telegram_config');
+      if (tel?.value) setTelegramConfig(tel.value);
+      const em = data.find(d => d.key === 'notify_email');
+      if (em?.value?.email) setNotifyEmail(em.value.email);
     } catch (e) { console.error(e); }
   };
 
   const fetchSchedule = async (userId: string) => {
     if (!supabase) return;
     try {
-      const { data, error } = await supabase.from('schedules').select('*').eq('user_id', userId).order('day_index', { ascending: true });
+      const { data, error } = await supabase
+        .from('schedules')
+        .select('user_id, day_index, start_time, end_time, is_off')
+        .eq('user_id', userId)
+        .order('day_index', { ascending: true });
       if (error) throw error;
 
       const fullSchedule = DAYS_OF_WEEK.map((_, index) => {
@@ -667,7 +678,9 @@ export const App: React.FC = () => {
   const fetchAllSchedules = async () => {
     if (!supabase) return;
     try {
-      const { data, error } = await supabase.from('schedules').select('*');
+      const { data, error } = await supabase
+        .from('schedules')
+        .select('id, user_id, day_index, start_time, end_time, is_off');
       if (error) throw error;
       const parsedData = (data || []).map(s => {
         const st = s.start_time || '09:00';
@@ -788,9 +801,22 @@ export const App: React.FC = () => {
   const fetchEmployees = async () => {
     if (!supabase) return;
     try {
-      const { data: emps, error } = await supabase.from('profiles').select('*').order('full_name', { ascending: true });
-      const { data: activeShifts } = await supabase.from('shifts').select('*').is('check_out', null);
+      // Traer campos específicos de perfiles
+      const { data: emps, error } = await supabase
+        .from('profiles')
+        .select('id, full_name, role, status, email, dni, cuil, phone, address, birth_date, bank_accounts, pin, permissions')
+        .order('full_name', { ascending: true });
+
+      // Traer únicamente marcas abiertas recientes (últimas 24 hs), evitando recorrer todo el historial huérfano
+      const last24Hours = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { data: activeShifts } = await supabase
+        .from('shifts')
+        .select('id, user_id, check_in, status')
+        .is('check_out', null)
+        .gte('check_in', last24Hours);
+
       if (error) throw error;
+      setSupabaseError(null);
       const employeesList: Employee[] = (emps || []).map(e => {
         const activeShift = activeShifts?.find(s => s.user_id === e.id);
         return {
@@ -806,21 +832,28 @@ export const App: React.FC = () => {
           setMyCheckInTime(me.checkIn);
         }
       }
-    } catch (e) { console.error(e); }
+    } catch (e: any) {
+      console.error(e);
+      if (e?.message) {
+        setSupabaseError(e.message);
+      }
+    }
   };
 
   const fetchMyShifts = async (userId: string) => {
-    if (!supabase) return;
+    if (!supabase || !userId) return;
     try {
       const oneMonthAgo = getNow();
       oneMonthAgo.setDate(oneMonthAgo.getDate() - 31);
 
+      // Traer sólo las columnas necesarias y limitar a los últimos 40 registros
       const { data, error } = await supabase
         .from('shifts')
-        .select('*')
+        .select('id, user_id, check_in, check_out, status')
         .eq('user_id', userId)
         .gte('check_in', oneMonthAgo.toISOString())
-        .order('check_in', { ascending: false });
+        .order('check_in', { ascending: false })
+        .limit(40);
 
       if (data) setMyShifts(data);
     } catch (e) { console.error(e); }
@@ -881,7 +914,7 @@ export const App: React.FC = () => {
     setIsSaving(true);
     try {
       const now = getNow();
-      const { data: openShift } = await supabase.from('shifts').select('*').eq('user_id', userId).is('check_out', null).order('check_in', { ascending: false }).limit(1).maybeSingle();
+      const { data: openShift } = await supabase.from('shifts').select('id, check_in').eq('user_id', userId).is('check_out', null).order('check_in', { ascending: false }).limit(1).maybeSingle();
 
       if (openShift) {
         const checkInDate = new Date(openShift.check_in);
@@ -940,7 +973,7 @@ export const App: React.FC = () => {
     try {
       let query = supabase
         .from('shifts')
-        .select('*, profiles(full_name)')
+        .select('check_in, check_out, status, profiles(full_name)')
         .gte('check_in', `${exportDates.from}T00:00:00Z`)
         .lte('check_in', `${exportDates.to}T23:59:59Z`);
 
@@ -1000,11 +1033,20 @@ export const App: React.FC = () => {
     const user = currentU || currentUser;
     if (!supabase || !user) return;
     try {
-      const { data: dcs, error } = await supabase.from('documents').select(`*`).order('created_at', { ascending: false });
+      // OPTIMIZACIÓN: Solo traemos metadatos sin 'file_url'. El archivo pesado se descarga bajo demanda al hacer clic.
+      let query = supabase.from('documents')
+        .select('id, user_id, title, description, category, visibility, target_user_id, requires_signature, signature_data, created_at')
+        .order('created_at', { ascending: false });
+
+      if (user.role !== 'admin' && user.role !== 'manager') {
+        query = query.or(`visibility.eq.public,user_id.eq.${user.id},target_user_id.eq.${user.id}`);
+      }
+
+      const { data: dcs, error } = await query;
 
       let allSigs: any[] = [];
       if (user.role === 'admin' || user.role === 'manager') {
-        const { data } = await supabase.from('document_signatures').select('*, profiles(full_name)');
+        const { data } = await supabase.from('document_signatures').select('id, document_id, user_id, signature_data, signed_at, profiles(full_name)');
         if (data) allSigs = data;
       } else {
         const { data } = await supabase.from('document_signatures').select('document_id, signature_data, signed_at').eq('user_id', user.id);
@@ -1013,39 +1055,31 @@ export const App: React.FC = () => {
 
       if (error) throw error;
       if (dcs) {
-        const mappedDocs: HRDocument[] = dcs
-          .filter(d => {
-            if (user.role === 'admin') return true;
-            if (d.visibility === 'public') return true;
-            if (user && d.user_id === user.id) return true;
-            if (user && d.target_user_id === user.id) return true;
-            return false;
-          })
-          .map(d => {
-            const author = employees.find(e => e.id === d.user_id);
-            const targetUser = employees.find(e => e.id === d.target_user_id);
+        const mappedDocs: HRDocument[] = dcs.map(d => {
+          const author = employees.find(e => e.id === d.user_id);
+          const targetUser = employees.find(e => e.id === d.target_user_id);
 
-            const docSigs = allSigs.filter(s => s.document_id === d.id);
-            const mySig = docSigs.find(s => s.user_id === user.id);
-            const legacySig = d.visibility === 'private' && d.target_user_id === user.id ? d.signature_data : null;
+          const docSigs = allSigs.filter(s => s.document_id === d.id);
+          const mySig = docSigs.find(s => s.user_id === user.id);
+          const legacySig = d.visibility === 'private' && d.target_user_id === user.id ? d.signature_data : null;
 
-            return {
-              id: d.id,
-              userId: d.user_id,
-              userName: author?.name || 'anónimo',
-              targetUserId: d.target_user_id,
-              targetUserName: targetUser?.name,
-              title: d.title,
-              description: d.description,
-              fileUrl: d.file_url,
-              category: d.category,
-              visibility: d.visibility || 'public',
-              requiresSignature: d.requires_signature || false,
-              signatureData: mySig ? mySig.signature_data : legacySig,
-              date: new Date(d.created_at).toLocaleDateString(),
-              allSignatures: (user.role === 'admin' || user.role === 'manager') ? docSigs : undefined
-            };
-          });
+          return {
+            id: d.id,
+            userId: d.user_id,
+            userName: author?.name || 'anónimo',
+            targetUserId: d.target_user_id,
+            targetUserName: targetUser?.name,
+            title: d.title,
+            description: d.description,
+            fileUrl: undefined, // Se descarga bajo demanda
+            category: d.category,
+            visibility: d.visibility || 'public',
+            requiresSignature: d.requires_signature || false,
+            signatureData: mySig ? mySig.signature_data : legacySig,
+            date: new Date(d.created_at).toLocaleDateString(),
+            allSignatures: (user.role === 'admin' || user.role === 'manager') ? docSigs : undefined
+          };
+        });
         setDocs(mappedDocs);
       }
     } catch (err) { console.error(err); }
@@ -1086,7 +1120,19 @@ export const App: React.FC = () => {
   const loadInitialData = async (user: User) => {
     if (!supabase) return;
     try {
-      const { data: reqs, error } = await supabase.from('requests').select(`*`).order('created_at', { ascending: false });
+      // Traer sólo las columnas necesarias de requests y limitar a los últimos 50 registros
+      let reqQuery = supabase
+        .from('requests')
+        .select('id, user_id, type, reason, status, peer_id, peer_accepted, metadata, created_at')
+        .order('created_at', { ascending: false })
+        .limit(50);
+
+      // Si no es admin/manager, sólo consultar trámites propios o donde participa
+      if (user.role !== 'admin' && user.role !== 'manager' && user.id) {
+        reqQuery = reqQuery.or(`user_id.eq.${user.id},peer_id.eq.${user.id}`);
+      }
+
+      const { data: reqs, error } = await reqQuery;
       if (error) throw error;
       if (reqs) {
         const mappedReqs = reqs.map(r => {
@@ -1099,10 +1145,6 @@ export const App: React.FC = () => {
         setRequests(mappedReqs);
       }
       await fetchDocuments(user);
-      if (user.id) {
-        await fetchMyShifts(user.id);
-        await fetchSchedule(user.id);
-      }
       setDataLoaded(true);
     } catch (err) { console.error(err); }
   };
@@ -1234,8 +1276,14 @@ export const App: React.FC = () => {
           }
         }
 
-        const { data: shifts } = await supabase.from('shifts').select('id').eq('user_id', currentUser.id).is('check_out', null).order('check_in', { ascending: false });
-        const openShift = shifts && shifts.length > 0 ? shifts[0] : null;
+        const { data: openShift } = await supabase
+          .from('shifts')
+          .select('id')
+          .eq('user_id', currentUser.id)
+          .is('check_out', null)
+          .order('check_in', { ascending: false })
+          .limit(1)
+          .maybeSingle();
 
         if (openShift) {
           await supabase.from('shifts').update({ check_out: now.toISOString(), status: 'completo' }).eq('id', openShift.id);
@@ -1316,12 +1364,18 @@ export const App: React.FC = () => {
         }]);
       }
 
+      // Evitar guardar el Base64 duplicado en el jsonb de metadata de requests
+      const cleanMetadata = { ...newRequest.metadata };
+      if (cleanMetadata.certificateUrl && cleanMetadata.certificateUrl.length > 100) {
+        cleanMetadata.certificateUrl = 'guardado_en_documentos';
+      }
+
       const { error } = await supabase.from('requests').insert([{
         user_id: currentUser.id,
         type: newRequest.type,
         reason: newRequest.reason || null,
         peer_id: newRequest.peerId || null,
-        metadata: newRequest.metadata,
+        metadata: cleanMetadata,
         status: 'pendiente'
       }]);
       if (error) throw error;
@@ -1408,30 +1462,86 @@ export const App: React.FC = () => {
     } catch (e) { addToast("error", "no se pudo eliminar", "error"); } finally { setIsSaving(false); }
   };
 
-  const processFile = (file: File) => {
-    if (file.size > 3.0 * 1024 * 1024) {
-      addToast("archivo pesado", "límite 3mb", "warning");
-      return;
-    }
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      setNewDoc(prev => ({ ...prev, fileUrl: reader.result as string }));
-      addToast("documento", "archivo cargado correctamente", "success");
-    };
-    reader.readAsDataURL(file);
+  const compressImageIfNeeded = async (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      if (!file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const MAX_WIDTH = 1200;
+          const MAX_HEIGHT = 1200;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height) {
+            if (width > MAX_WIDTH) {
+              height *= MAX_WIDTH / width;
+              width = MAX_WIDTH;
+            }
+          } else {
+            if (height > MAX_HEIGHT) {
+              width *= MAX_HEIGHT / height;
+              height = MAX_HEIGHT;
+            }
+          }
+
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(width);
+          canvas.height = Math.round(height);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(e.target?.result as string);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          // Comprimir a JPEG con calidad 0.75 (reduce el peso de ~5MB a ~120KB)
+          const compressed = canvas.toDataURL('image/jpeg', 0.75);
+          resolve(compressed);
+        };
+        img.onerror = () => resolve(e.target?.result as string);
+        img.src = e.target?.result as string;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   };
 
-  const processCertificate = (file: File) => {
-    if (file.size > 3.0 * 1024 * 1024) {
-      addToast("archivo pesado", "límite 3mb", "warning");
+  const processFile = async (file: File) => {
+    if (file.size > 5.0 * 1024 * 1024) {
+      addToast("archivo pesado", "límite 5mb", "warning");
       return;
     }
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      setNewRequest(prev => ({ ...prev, metadata: { ...prev.metadata, certificateUrl: reader.result as string } }));
-      addToast("certificado", "archivo adjunto correctamente", "success");
-    };
-    reader.readAsDataURL(file);
+    try {
+      addToast("procesando", "optimizando archivo...", "info");
+      const compressed = await compressImageIfNeeded(file);
+      setNewDoc(prev => ({ ...prev, fileUrl: compressed }));
+      addToast("documento", "archivo cargado y optimizado", "success");
+    } catch {
+      addToast("error", "falló al procesar archivo", "error");
+    }
+  };
+
+  const processCertificate = async (file: File) => {
+    if (file.size > 5.0 * 1024 * 1024) {
+      addToast("archivo pesado", "límite 5mb", "warning");
+      return;
+    }
+    try {
+      addToast("procesando", "optimizando certificado...", "info");
+      const compressed = await compressImageIfNeeded(file);
+      setNewRequest(prev => ({ ...prev, metadata: { ...prev.metadata, certificateUrl: compressed } }));
+      addToast("certificado", "archivo adjunto y optimizado", "success");
+    } catch {
+      addToast("error", "falló al procesar certificado", "error");
+    }
   };
 
   const handleDocFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1503,16 +1613,38 @@ export const App: React.FC = () => {
     } catch (e) { addToast("error", "falló la actualización", "error"); } finally { setIsSaving(false); }
   };
 
-  const handleDownload = (url: string, filename: string) => {
+  const getDocFileUrl = async (docId: string, cachedUrl?: string): Promise<string | null> => {
+    if (cachedUrl && cachedUrl.length > 50) return cachedUrl;
+    if (!supabase) return null;
+    addToast("descarga", "obteniendo archivo...", "info");
+    try {
+      const { data, error } = await supabase.from('documents').select('file_url').eq('id', docId).single();
+      if (error || !data?.file_url) {
+        addToast("error", "no se pudo obtener el archivo", "error");
+        return null;
+      }
+      return data.file_url;
+    } catch {
+      addToast("error", "error de conexión al obtener archivo", "error");
+      return null;
+    }
+  };
+
+  const handleDownload = async (docId: string, filename: string, cachedUrl?: string) => {
+    const url = await getDocFileUrl(docId, cachedUrl);
+    if (!url) return;
     const link = document.createElement('a');
     link.href = url;
     link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    addToast("descarga", "descarga iniciada", "success");
   };
 
-  const handlePreview = (dataUrl: string) => {
+  const handlePreview = async (docId: string, cachedUrl?: string) => {
+    const dataUrl = await getDocFileUrl(docId, cachedUrl);
+    if (!dataUrl) return;
     try {
       if (!dataUrl.startsWith('data:')) {
         window.open(dataUrl, '_blank');
@@ -1653,6 +1785,12 @@ export const App: React.FC = () => {
           <div className="bg-white/80 backdrop-blur-2xl p-12 rounded-[56px] shadow-2xl border border-white">
             <div className="mb-12 text-center"><div className="w-20 h-20 bg-midnight text-white flex items-center justify-center rounded-[28px] font-bold mx-auto mb-8 shadow-2xl">rh</div><h1 className="text-3xl font-light tracking-tighter text-midnight">minimal.</h1></div>
             <form onSubmit={handleLogin} className="space-y-5">
+              {supabaseError && (
+                <div className="bg-rose-50 border border-rose-200 text-rose-700 p-4 rounded-[20px] text-[11px] leading-relaxed">
+                  <span className="font-bold uppercase tracking-wider block text-[9px] text-rose-800 mb-1">Aviso de Supabase</span>
+                  {supabaseError}
+                </div>
+              )}
               {!isAdminMode && (
                 <select className="w-full bg-white/60 border border-slate-100 rounded-[24px] py-5 px-6 text-sm font-medium outline-none" value={selectedUserId} onChange={(e) => setSelectedUserId(e.target.value)}>
                   <option value="">seleccionar personal</option>
@@ -2047,8 +2185,8 @@ export const App: React.FC = () => {
                           <span className="text-[10px] font-bold text-slate-400 lowercase truncate max-w-[80px]">{doc.userName}</span>
                         </div>
                         <div className="flex items-center gap-1">
-                          <button onClick={() => handleDownload(doc.fileUrl, doc.title)} title="descargar" className="p-3 bg-white text-indigo-600 rounded-2xl hover:bg-indigo-600 hover:text-white shadow-sm transition-all active:scale-95"><Download size={18} /></button>
-                          <button onClick={() => handlePreview(doc.fileUrl)} title="ver en pestaña" className="p-3 bg-white text-emerald-600 rounded-2xl hover:bg-emerald-600 hover:text-white shadow-sm transition-all active:scale-95"><ExternalLink size={18} /></button>
+                          <button onClick={() => handleDownload(doc.id, doc.title, doc.fileUrl)} title="descargar" className="p-3 bg-white text-indigo-600 rounded-2xl hover:bg-indigo-600 hover:text-white shadow-sm transition-all active:scale-95"><Download size={18} /></button>
+                          <button onClick={() => handlePreview(doc.id, doc.fileUrl)} title="ver en pestaña" className="p-3 bg-white text-emerald-600 rounded-2xl hover:bg-emerald-600 hover:text-white shadow-sm transition-all active:scale-95"><ExternalLink size={18} /></button>
                           {(currentUser?.role === 'admin' || currentUser?.role === 'manager') && (
                             <button onClick={() => setConfirmDelete({ isOpen: true, id: doc.id, name: doc.title, type: 'document' })} className="p-3 bg-white text-rose-500 rounded-2xl hover:bg-rose-500 hover:text-white shadow-sm transition-all opacity-0 group-hover:opacity-100"><Trash2 size={18} /></button>
                           )}

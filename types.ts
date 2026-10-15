@@ -100,7 +100,7 @@ export interface HRDocument {
   targetUserName?: string;
   title: string;
   description: string;
-  fileUrl: string;
+  fileUrl?: string;
   category: 'recibo de sueldo' | 'memo' | 'tutoriales' | 'otros';
   visibility: 'public' | 'private';
   requiresSignature: boolean;
