@@ -1643,25 +1643,49 @@ export const App: React.FC = () => {
   };
 
   const handlePreview = async (docId: string, cachedUrl?: string) => {
-    const dataUrl = await getDocFileUrl(docId, cachedUrl);
-    if (!dataUrl) return;
+    const tab = window.open('about:blank', '_blank');
+    if (!tab) {
+      addToast("vista previa", "permití las ventanas emergentes o descargá el archivo", "warning");
+      return;
+    }
+
+    let blobUrl: string | undefined;
     try {
-      if (!dataUrl.startsWith('data:')) {
-        window.open(dataUrl, '_blank');
+      tab.opener = null;
+      const fileUrl = await getDocFileUrl(docId, cachedUrl);
+      if (!fileUrl || tab.closed) {
+        tab.close();
         return;
       }
-      const parts = dataUrl.split(';base64,');
-      const contentType = parts[0].split(':')[1];
-      const raw = window.atob(parts[1]);
-      const rawLength = raw.length;
-      const uInt8Array = new Uint8Array(rawLength);
-      for (let i = 0; i < rawLength; ++i) uInt8Array[i] = raw.charCodeAt(i);
-      const blob = new Blob([uInt8Array], { type: contentType });
-      const blobUrl = URL.createObjectURL(blob);
-      window.open(blobUrl, '_blank');
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
-      addToast("vista previa", "abriendo documento", "info");
-    } catch (e) { addToast("error", "no se pudo previsualizar", "error"); }
+
+      if (!fileUrl.startsWith('data:')) {
+        const url = new URL(fileUrl, window.location.href);
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+          throw new Error('enlace de documento inválido');
+        }
+        tab.location.replace(url.href);
+        return;
+      }
+
+      const response = await fetch(fileUrl);
+      if (!response.ok) throw new Error('archivo inválido');
+      const blob = await response.blob();
+      if (tab.closed) return;
+
+      const previewUrl = URL.createObjectURL(blob);
+      blobUrl = previewUrl;
+      tab.location.replace(previewUrl);
+      const cleanup = window.setInterval(() => {
+        if (tab.closed) {
+          window.clearInterval(cleanup);
+          URL.revokeObjectURL(previewUrl);
+        }
+      }, 1000);
+    } catch {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      tab.close();
+      addToast("error", "no se pudo previsualizar. probá descargar el archivo", "error");
+    }
   };
 
   const formatForDatetimeLocal = (dateStr: string | null) => {
